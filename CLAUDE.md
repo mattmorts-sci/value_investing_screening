@@ -1,4 +1,4 @@
-# Algorithmic Investing Pipeline
+# Value Investing Screening Pipeline
 
 ## Environment
 
@@ -8,17 +8,13 @@
 
 ## Project Documents
 
-<!-- - **Architecture:** [path, e.g. docs/ARCHITECTURE.md] -->
-- **Contracts:** `Pers/algorithmic-investing/contracts.py`
-<!-- - **Design docs:** `Pers/algorithmic-investing/TECHNICAL_REFERENCE.md`, `Pers/algorithmic-investing/USER_GUIDE.md`  -->
-<!-- - **Task tracking:** [path, e.g. REBUILD_PLAN.md] -->
+- **Technical reference:** `TECHNICAL_REFERENCE.md`
+- **User guide:** `USER_GUIDE.md`
 
-<!-- All design documents are in path Pers/algorithmic-investing/docs  -->
-
-## Code documentation
+## Code Documentation
 The following must be kept up to date:
-- TECHNICAL_REFERENCE.md - this document is a technical document for agent reference
-- USER_GUIDE.md - this is a detailed, plan English user reference
+- `TECHNICAL_REFERENCE.md` — technical reference for agent use (architecture, interfaces, data flow)
+- `USER_GUIDE.md` — detailed, plain English user reference
 
 ## Agent Team Conventions
 
@@ -53,7 +49,21 @@ Discard:
 
 ## Coding Workflow
 
-Skills are in `.claude/skills/`. 
+Skills are in `.claude/skills/`. Available skills:
+
+- `/analyse` — Legacy code analysis. Produces structured inventory of
+  modules, dependencies, data flow, and technical debt. Read-only.
+  Feeds into `/design`.
+- `/design` — Refactoring design brief. Covers legacy summary, target
+  design, keep/rewrite/delete classification, migration strategy.
+  Solo mode, iterative human input.
+- `/coord` — Task coordination. Selects mode (solo/build/team) and
+  manages the refactoring workflow through four gates:
+  analyse → design → implement → verify.
+- `/verify` — Code and documentation review. Build, Team, and Accuracy
+  modes with adversarial personas and consensus rule.
+- `/commit` — Pre-commit checks (ruff → mypy → pytest) and git commit.
+  Use `--docs` for documentation-only commits.
 
 Human checkpoints:
 1. Design decisions (before implementation begins)
@@ -72,14 +82,15 @@ by `/commit` at the end of the workflow.
 - Type check: `mypy .`
 - Pre-commit sequence: `ruff check . && mypy . && pytest -v`
 
+Note: dev tools (ruff, mypy, pytest) not yet installed. Install before
+first `/commit`.
+
 ## Data Sources
 
-- **SQLite:** Local database for cached/downloaded data. Never modify raw data files.
-No sqlite3 CLI. Use Python instead.1
+- **yfinance:** Real-time market data (prices, financials) via Yahoo Finance API
+- **CSV:** Static reference data in `input/` directory. Never modify raw data files.
 
 ## Code Style
-
-See `STYLE_GUIDE.md` for full conventions. Critical rules repeated here:
 
 - All configurable values imported from central config — never hardcoded in source files
 - `logging` module only — no `print()` statements in source files
@@ -90,13 +101,12 @@ See `STYLE_GUIDE.md` for full conventions. Critical rules repeated here:
 ## Error Handling
 
 - **Data integrity issues:** Hard failure. Raise exceptions on ambiguous, missing, or contradictory data. No silent defaults.
-- **Expected operational conditions:** Handle gracefully where ARCHITECTURE.md explicitly defines the behaviour. Examples: skip windows with insufficient samples (log warning), fill NaN with 0 (log explicitly), skip windows where all models fail (log error).
-- **No data leakage.** Training data must never contain future information.
+- **Expected operational conditions:** Handle gracefully where documented. Examples: skip tickers with insufficient data (log warning), handle API rate limits with retry/backoff.
 - **Ask, don't assume** on financial logic.
 
 ## Current Status
 
-live data testing of the full pipeline.
+Preparing to refactor legacy code. Legacy code is in `LEGACY/`.
 
 ## Accumulated Rules
 
@@ -109,7 +119,7 @@ live data testing of the full pipeline.
 - Australian English.
 - One block at a time. Only read documents needed for the current block.
 - One question or decision at a time.
-- Update CONTRACTS.md, pyproject.toml etc. at end of each build phase.
+- Update TECHNICAL_REFERENCE.md, USER_GUIDE.md etc. at end of each build phase.
 - Never create a config parameter derivable from an existing one.
 - No sycophancy. Assess independently; disagree with reasoning when warranted.
 - Direct, factual language. No hedging, no filler.
