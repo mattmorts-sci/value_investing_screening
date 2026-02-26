@@ -1,7 +1,7 @@
 """Per-company growth statistics from time series data.
 
 Computes mean, variance, standard deviation, and CAGR for FCF and
-revenue growth using TTM (trailing twelve month) smoothing.
+revenue growth using raw quarter-over-quarter growth rates.
 Produces combined growth and stability metrics.
 """
 
@@ -18,7 +18,6 @@ logger = logging.getLogger(__name__)
 
 _MIN_DATA_POINTS = 3
 _MIN_CAGR_QUARTERS = 4
-_TTM_WINDOW = 4
 
 
 def _calculate_cagr(values: pd.Series) -> float:
@@ -77,28 +76,26 @@ def _calculate_cagr(values: pd.Series) -> float:
         return 0.0
 
 
-def _compute_ttm_growth(values: pd.Series) -> pd.Series:
-    """Compute quarter-over-quarter growth of trailing twelve month sums.
+def _compute_raw_qoq_growth(values: pd.Series) -> pd.Series:
+    """Compute raw quarter-over-quarter growth rates.
 
-    Smooths quarterly lumpiness (capex timing, working capital swings)
-    by summing 4 quarters into a TTM figure, then measuring growth of
-    that smoothed series.
+    g = (Q_t - Q_{t-1}) / |Q_{t-1}|
 
-    With 20 quarters of input this yields ~16 TTM growth observations.
+    Absolute-value denominator handles sign transitions without
+    producing NaN. With ~20 quarters of input this yields ~19
+    independent observations with no autocorrelation.
 
     Args:
         values: Quarterly absolute values (FCF or revenue), ordered
-            chronologically. Must have at least 5 entries to produce
+            chronologically. Must have at least 2 entries to produce
             any growth observations.
 
     Returns:
-        Series of TTM growth rates (quarter-over-quarter). NaN entries
-        are present where the TTM window is incomplete or the
-        denominator is zero.
+        Series of QoQ growth rates. NaN where the previous quarter's
+        value is zero.
     """
-    ttm = values.rolling(window=_TTM_WINDOW, min_periods=_TTM_WINDOW).sum()
-    ttm_prev = ttm.shift(1)
-    growth = (ttm - ttm_prev) / ttm_prev.abs()
+    prev = values.shift(1)
+    growth = (values - prev) / prev.abs()
     return growth.replace([np.inf, -np.inf], np.nan)
 
 
@@ -108,10 +105,9 @@ def compute_growth_statistics(
 ) -> pd.DataFrame:
     """Compute per-company growth statistics from time series.
 
-    Growth rates are derived from TTM (trailing twelve month) sums of
-    the raw quarterly FCF and revenue series. This smooths quarterly
-    lumpiness (capex timing, working capital swings) at source, producing
-    stable mean/std inputs for the fade-to-equilibrium projection model.
+    Growth rates are raw quarter-over-quarter changes:
+    g = (Q_t - Q_{t-1}) / |Q_{t-1}|. Independent observations with no
+    autocorrelation, used to parameterise the Monte Carlo simulation.
 
     Args:
         data: Multi-period DataFrame from loader. Must contain columns:
@@ -134,7 +130,7 @@ def compute_growth_statistics(
     if missing:
         raise ValueError(f"Missing required columns: {sorted(missing)}")
 
-    # Sort by entity and time for correct CAGR and TTM ordering.
+    # Sort by entity and time for correct CAGR and QoQ ordering.
     sorted_data = data.sort_values(["entity_id", "period_idx"])
 
     rows: list[dict[str, object]] = []
@@ -143,8 +139,8 @@ def compute_growth_statistics(
         row: dict[str, object] = {"entity_id": entity_id}
 
         for metric, abs_col in [("fcf_growth", "fcf"), ("revenue_growth", "revenue")]:
-            ttm_growth = _compute_ttm_growth(group[abs_col])
-            valid = ttm_growth.dropna()
+            qoq_growth = _compute_raw_qoq_growth(group[abs_col])
+            valid = qoq_growth.dropna()
 
             if len(valid) >= _MIN_DATA_POINTS:
                 row[f"{metric}_mean"] = float(valid.mean())
@@ -155,7 +151,7 @@ def compute_growth_statistics(
                 row[f"{metric}_var"] = 0.0
                 row[f"{metric}_std"] = 0.0
                 logger.warning(
-                    "Entity %s has only %d valid TTM %s growth points "
+                    "Entity %s has only %d valid QoQ %s growth points "
                     "(need %d); defaulting stats to 0.0",
                     entity_id,
                     len(valid),

@@ -171,13 +171,35 @@ class AnalysisConfig:
     common_range_lower_pct: float = 0.10
     common_range_upper_pct: float = 0.90
 
-    # -- Growth projection (fade-to-equilibrium) --
+    # -- Growth projection (negative FCF: fade-to-equilibrium) --
     equilibrium_growth_rate: float = 0.03
     base_fade_half_life_years: float = 2.5
     scenario_band_width: float = 1.0
     negative_fcf_improvement_cap: float = 0.15
     projection_periods: tuple[int, ...] = (5, 10)
     primary_period: int = 5
+
+    # -- Growth projection (positive FCF: Monte Carlo) --
+    simulation_replicates: int = 10_000
+    cv_cap: float = 1.0
+    cumulative_growth_cap: float = 10.0
+    cumulative_decline_floor: float = 0.1
+    annual_cagr_backstop: float = 1.0
+    momentum_exhaustion_threshold: float = 2.0
+    time_decay_base: float = 0.8
+    high_growth_threshold: float = 0.3
+    size_penalty_factor: float = 0.1
+
+    # Per-quarter growth caps (asymmetric by metric and size evolution).
+    # "small" = cumulative growth <= 2.0x, "large" = > 2.0x.
+    fcf_small_pos_cap: float = 0.40
+    fcf_small_neg_cap: float = -0.30
+    fcf_large_pos_cap: float = 0.25
+    fcf_large_neg_cap: float = -0.20
+    revenue_small_pos_cap: float = 0.25
+    revenue_small_neg_cap: float = -0.15
+    revenue_large_pos_cap: float = 0.15
+    revenue_large_neg_cap: float = -0.10
 
     # -- DCF --
     discount_rate: float = 0.10
@@ -186,7 +208,7 @@ class AnalysisConfig:
     quarters_per_year: int = 4
 
     # -- Filtering --
-    enable_negative_fcf_filter: bool = True
+    enable_negative_fcf_filter: bool = False
     enable_data_consistency_filter: bool = True
     enable_market_cap_filter: bool = True
     enable_debt_cash_filter: bool = True

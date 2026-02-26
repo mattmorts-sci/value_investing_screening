@@ -1,18 +1,9 @@
-"""Fade-to-equilibrium growth projection model.
+"""Monte Carlo growth projection with constraint system.
 
-Deterministic model replacing the legacy Monte Carlo simulation.
-Projects growth rates for FCF and revenue using exponential fade
-toward a long-run equilibrium rate.
-
-Model: g(t) = g_eq + (g_0 - g_eq) * exp(-lambda * t)
-
-Three scenarios per metric per period:
-- base: fade from mean historical growth
-- optimistic: fade from mean + k * sigma
-- pessimistic: fade from mean - k * sigma
-
-Negative FCF uses a separate improvement-toward-zero model
-with revenue-growth-derived improvement rates.
+Positive-FCF companies: Monte Carlo simulation with 8 constraint
+layers, extracting P25/P50/P75 scenarios.
+Negative-FCF companies: improvement-toward-zero model using
+revenue-growth-derived improvement rates.
 """
 
 import logging
@@ -29,95 +20,268 @@ logger = logging.getLogger(__name__)
 
 
 def _safe_float(value: object, default: float = 0.0) -> float:
-    """Convert to float, replacing NaN/None with default."""
+    """Convert to float, replacing NaN/None/inf with default."""
     if value is None:
         return default
     f: float = float(value)  # type: ignore[arg-type]
-    if np.isnan(f):
+    if np.isnan(f) or np.isinf(f):
         return default
     return f
 
 
-def _quarterly_rate(annual_rate: float) -> float:
-    """Convert an annual rate to quarterly via compound interest.
+def _parameterise_lognormal(
+    m: float,
+    s: float,
+    cv_cap: float,
+) -> tuple[float, float]:
+    """Convert growth mean/std to log-normal mu, sigma parameters.
 
-    Clamps to [-0.99, +inf) to prevent negative base in fractional
-    exponentiation (which would raise ValueError).
-    """
-    clamped = max(annual_rate, -0.99)
-    return float((1 + clamped) ** 0.25 - 1)
+    For the growth multiplier Y = 1 + growth_rate:
+        target_mean = 1 + m
+        CV = min(s / target_mean, cv_cap)
+        sigma^2 = ln(1 + CV^2)
+        mu = ln(target_mean) - sigma^2 / 2
 
-
-def _compute_fade_lambda(
-    half_life_years: float,
-    market_cap: float,
-    min_market_cap: float,
-) -> float:
-    """Compute the exponential decay constant for the fade model.
+    Edge cases:
+        - m <= -0.5: deeply negative mean, defaults to 5% quarterly
+          decline (mu = ln(0.95), sigma = sqrt(0.1)).
+        - s <= 0 and m > -0.5: unknown volatility (e.g. insufficient
+          data). Uses mu = ln(1 + m) with small fixed sigma = 0.05.
+          When m = 0 this projects roughly flat rather than declining.
 
     Args:
-        half_life_years: Base half-life in years (time for growth to
-            move halfway to equilibrium).
-        market_cap: Company market capitalisation.
-        min_market_cap: Minimum market cap from config (scaling reference).
+        m: Mean quarterly growth rate.
+        s: Std of quarterly growth rate.
+        cv_cap: Maximum coefficient of variation.
 
     Returns:
-        Lambda (per-quarter decay constant). Higher = faster fade.
+        (mu, sigma) for log-normal sampling.
     """
-    base_lambda = math.log(2) / (half_life_years * 4)
-
-    # Larger companies fade faster (less room to grow)
-    if market_cap > 0 and min_market_cap > 0:
-        size_ratio = market_cap / min_market_cap
-        if size_ratio > 1:
-            size_adj = math.log10(size_ratio) * 0.1
-        else:
-            size_adj = 0.0
+    if m > -0.5 and s > 0:
+        target_mean = 1 + m
+        cv = min(s / target_mean, cv_cap)
+        sigma_sq = math.log(1 + cv**2)
+        mu = math.log(target_mean) - sigma_sq / 2
+    elif m <= -0.5:
+        # Deeply negative mean: 5% quarterly decline.
+        mu = math.log(0.95)
+        sigma_sq = 0.1
     else:
-        size_adj = 0.0
+        # Unknown volatility (s <= 0, m > -0.5): project at mean with
+        # minimal noise. When m = 0 this is roughly flat.
+        mu = math.log(max(1 + m, 0.01))
+        sigma_sq = 0.05**2
+    return mu, math.sqrt(sigma_sq)
 
-    return base_lambda * (1 + size_adj)
 
-
-def _fade_growth_rates(
-    g_0: float,
-    g_eq_q: float,
-    fade_lambda: float,
+def _simulate_monte_carlo(
+    current_value: float,
+    growth_mean: float,
+    growth_std: float,
+    market_cap: float,
     n_quarters: int,
-) -> list[float]:
-    """Generate quarterly growth rates using fade-to-equilibrium.
+    metric: str,
+    config: AnalysisConfig,
+    seed: int | None = None,
+) -> np.ndarray:
+    """Run vectorised Monte Carlo simulation for one metric.
 
-    g(t) = g_eq + (g_0 - g_eq) * exp(-lambda * t)
+    Simulates config.simulation_replicates paths of n_quarters steps.
+    Each step: sample from log-normal, apply 7 constraint layers.
 
     Args:
-        g_0: Starting quarterly growth rate.
-        g_eq_q: Equilibrium quarterly growth rate.
-        fade_lambda: Per-quarter decay constant.
-        n_quarters: Number of quarters to project.
+        current_value: Starting value (must be positive).
+        growth_mean: Mean quarterly growth rate from growth_stats.
+        growth_std: Std of quarterly growth rate from growth_stats.
+        market_cap: Company market capitalisation.
+        n_quarters: Number of quarters to simulate.
+        metric: "fcf" or "revenue" (selects per-quarter caps).
+        config: Analysis configuration.
+        seed: Optional RNG seed for reproducibility.
 
     Returns:
-        List of quarterly growth rates.
+        1D array of shape (simulation_replicates,) with final values.
     """
-    return [
-        g_eq_q + (g_0 - g_eq_q) * math.exp(-fade_lambda * t)
-        for t in range(1, n_quarters + 1)
-    ]
+    n = config.simulation_replicates
 
+    if current_value == 0:
+        return np.zeros(n, dtype=np.float64)
 
-def _project_values(
-    current_value: float,
-    growth_rates: list[float],
-) -> list[float]:
-    """Project values forward using per-quarter growth rates.
+    mu, sigma = _parameterise_lognormal(growth_mean, growth_std, config.cv_cap)
 
-    Value(t) = Value(t-1) * (1 + g(t))
-    """
-    values: list[float] = []
-    v = current_value
-    for g in growth_rates:
-        v = v * (1 + g)
-        values.append(v)
+    # Select per-quarter caps by metric
+    if metric == "fcf":
+        small_pos = config.fcf_small_pos_cap
+        small_neg = config.fcf_small_neg_cap
+        large_pos = config.fcf_large_pos_cap
+        large_neg = config.fcf_large_neg_cap
+    else:
+        small_pos = config.revenue_small_pos_cap
+        small_neg = config.revenue_small_neg_cap
+        large_pos = config.revenue_large_pos_cap
+        large_neg = config.revenue_large_neg_cap
+
+    values = np.full(n, current_value, dtype=np.float64)
+    recent_growth = np.zeros((n, 4), dtype=np.float64)
+    rng = np.random.default_rng(seed)
+
+    for t in range(n_quarters):
+        # --- Constraint 6: Momentum exhaustion ---
+        adjusted_mu = np.full(n, mu)
+        if t >= 4 and growth_mean > config.high_growth_threshold:
+            avg_recent = recent_growth.mean(axis=1)
+
+            high_mask = (
+                avg_recent > growth_mean * config.momentum_exhaustion_threshold
+            )
+            if high_mask.any():
+                excess = avg_recent[high_mask] / growth_mean
+                adj = -np.log(
+                    1 + (excess - config.momentum_exhaustion_threshold) * 0.2,
+                )
+                adjusted_mu[high_mask] += np.maximum(adj, -0.3)
+
+            low_mask = avg_recent < growth_mean * 0.5
+            if low_mask.any():
+                shortfall = avg_recent[low_mask] / growth_mean
+                adj = np.log(1 + (0.5 - shortfall) * 0.1)
+                adjusted_mu[low_mask] += np.minimum(adj, 0.2)
+
+        # --- Constraint 1: Log-normal sampling ---
+        growth_rate = np.exp(rng.normal(adjusted_mu, sigma)) - 1
+
+        # --- Constraint 2: Per-quarter caps (asymmetric by size) ---
+        size_evolution = np.abs(values / current_value)
+        large = size_evolution > 2.0
+        pos_cap = np.where(large, large_pos, small_pos)
+        neg_cap = np.where(large, large_neg, small_neg)
+        growth_rate = np.clip(growth_rate, neg_cap, pos_cap)
+
+        # --- Constraint 8: Size-based growth penalty ---
+        if market_cap > 0:
+            value_to_market = np.abs(values) / market_cap
+            size_factor = np.where(
+                value_to_market < 0.001,
+                0.8,
+                np.where(
+                    value_to_market < 0.01,
+                    np.clip(0.03 / value_to_market, 0.5, 0.9),
+                    np.clip(
+                        config.size_penalty_factor / value_to_market,
+                        0.4,
+                        1.0,
+                    ),
+                ),
+            )
+        else:
+            size_factor = np.ones(n)
+
+        # --- Constraint 7: Time decay for high growth ---
+        if t > 0:
+            years_elapsed = t / config.quarters_per_year
+            time_factor = np.where(
+                growth_rate > config.high_growth_threshold,
+                config.time_decay_base**years_elapsed,
+                1.0,
+            )
+        else:
+            time_factor = np.ones(n)
+
+        # Apply all per-step constraints
+        constrained_growth = growth_rate * size_factor * time_factor
+
+        # Update momentum window (shift left, append new)
+        recent_growth[:, :-1] = recent_growth[:, 1:]
+        recent_growth[:, -1] = constrained_growth
+
+        # Apply growth
+        values *= 1 + constrained_growth
+
+        # --- Constraint 3: Cumulative cap (10x) and floor (0.1x) ---
+        ratio = values / current_value
+        exceeded = ratio > config.cumulative_growth_cap
+        if exceeded.any():
+            values[exceeded] = current_value * config.cumulative_growth_cap
+        declined = ratio < config.cumulative_decline_floor
+        if declined.any():
+            values[declined] = current_value * config.cumulative_decline_floor
+
+        # --- Constraint 4: 100% annual CAGR backstop (after year 1) ---
+        quarters_elapsed = t + 1
+        if quarters_elapsed > config.quarters_per_year:
+            max_value = current_value * (
+                (1 + config.annual_cagr_backstop)
+                ** (quarters_elapsed / config.quarters_per_year)
+            )
+            backstop_exceeded = values > max_value
+            if backstop_exceeded.any():
+                values[backstop_exceeded] = max_value
+
     return values
+
+
+def _extract_scenarios(
+    entity_id: int,
+    metric: str,
+    period_years: int,
+    current_value: float,
+    final_values: np.ndarray,
+    n_quarters: int,
+) -> dict[str, Projection]:
+    """Extract P25/P50/P75 scenarios from simulated final values.
+
+    Back-calculates annual CAGR from each percentile's final value,
+    then projects a smooth compound path for the DCF.
+
+    Args:
+        entity_id: Company entity ID.
+        metric: "fcf" or "revenue".
+        period_years: Projection horizon in years.
+        current_value: Starting value.
+        final_values: 1D array of simulated final values.
+        n_quarters: Number of quarters in the projection.
+
+    Returns:
+        {scenario_name: Projection} for pessimistic/base/optimistic.
+    """
+    percentile_map = {
+        "pessimistic": 25,
+        "base": 50,
+        "optimistic": 75,
+    }
+
+    scenarios: dict[str, Projection] = {}
+
+    for scenario_name, pct in percentile_map.items():
+        final_val = float(np.percentile(final_values, pct))
+        annual_cagr = _compute_annual_cagr(current_value, final_val, period_years)
+
+        # Smooth compound path: constant quarterly rate implied by CAGR
+        if annual_cagr > -1.0:
+            quarterly_rate = (1 + annual_cagr) ** 0.25 - 1
+        else:
+            quarterly_rate = 0.0
+
+        quarterly_values: list[float] = []
+        quarterly_rates: list[float] = []
+        v = current_value
+        for _ in range(n_quarters):
+            v *= 1 + quarterly_rate
+            quarterly_values.append(v)
+            quarterly_rates.append(quarterly_rate)
+
+        scenarios[scenario_name] = Projection(
+            entity_id=entity_id,
+            metric=metric,
+            period_years=period_years,
+            scenario=scenario_name,
+            quarterly_growth_rates=quarterly_rates,
+            quarterly_values=quarterly_values,
+            annual_cagr=annual_cagr,
+            current_value=current_value,
+        )
+
+    return scenarios
 
 
 def _project_negative_fcf(
@@ -128,7 +292,7 @@ def _project_negative_fcf(
     g_eq_q: float,
     fade_lambda: float,
 ) -> tuple[list[float], list[float]]:
-    """Project negative FCF toward zero, then switch to standard fade.
+    """Project negative FCF toward zero, then switch to conservative fade.
 
     Negative FCF cannot use normal growth rates (percentage growth on a
     negative base is meaningless). Instead, the model applies a constant
@@ -229,26 +393,40 @@ def project_growth(
     revenue_stats: dict[str, float],
     market_cap: float,
     config: AnalysisConfig,
+    seed: int | None = None,
 ) -> dict[int, dict[str, dict[str, Projection]]]:
-    """Fade-to-equilibrium growth projection for one company.
+    """Project growth for one company.
+
+    Positive FCF: Monte Carlo simulation with constraint system,
+    extracting P25/P50/P75 scenarios.
+    Negative FCF: improvement-toward-zero model for FCF; Monte Carlo
+    for revenue.
 
     Args:
         entity_id: Company entity ID.
         fcf_stats: Keys: mean (quarterly), std (quarterly), latest_value.
         revenue_stats: Keys: mean (quarterly), std (quarterly), latest_value.
-        market_cap: Company market capitalisation (for size adjustment).
+        market_cap: Company market capitalisation.
         config: Analysis configuration.
+        seed: Optional RNG seed for reproducibility.
 
     Returns:
         {period_years: {metric: {scenario: Projection}}}
     """
-    g_eq_q = _quarterly_rate(config.equilibrium_growth_rate)
-    fade_lambda = _compute_fade_lambda(
-        config.base_fade_half_life_years,
-        market_cap,
-        config.min_market_cap,
-    )
-    k = config.scenario_band_width
+    fcf_is_negative = fcf_stats["latest_value"] < 0
+
+    # Pre-compute fade parameters for negative-FCF improvement model
+    if fcf_is_negative:
+        g_eq_q = (1 + config.equilibrium_growth_rate) ** 0.25 - 1
+        base_lambda = math.log(2) / (
+            config.base_fade_half_life_years * config.quarters_per_year
+        )
+        if market_cap > 0 and config.min_market_cap > 0:
+            size_ratio = market_cap / config.min_market_cap
+            size_adj = math.log10(size_ratio) * 0.1 if size_ratio > 1 else 0.0
+        else:
+            size_adj = 0.0
+        fade_lambda = base_lambda * (1 + size_adj)
 
     result: dict[int, dict[str, dict[str, Projection]]] = {}
 
@@ -257,33 +435,24 @@ def project_growth(
         period_result: dict[str, dict[str, Projection]] = {}
 
         for metric, stats in [("fcf", fcf_stats), ("revenue", revenue_stats)]:
-            g_0 = stats["mean"]
-            sigma = stats["std"]
             current_value = stats["latest_value"]
 
-            scenarios: dict[str, Projection] = {}
+            if metric == "fcf" and fcf_is_negative:
+                # Negative FCF: improvement model with 3 scenarios
+                k = config.scenario_band_width
+                scenarios: dict[str, Projection] = {}
 
-            for scenario_name, g_start in [
-                ("base", g_0),
-                ("optimistic", g_0 + k * sigma),
-                ("pessimistic", g_0 - k * sigma),
-            ]:
-                if metric == "fcf" and current_value < 0:
-                    # Negative FCF: improvement path
-                    # Scenario affects revenue growth assumption
-                    if scenario_name == "base":
-                        rev_growth = revenue_stats["mean"]
-                    elif scenario_name == "optimistic":
-                        rev_growth = (
-                            revenue_stats["mean"]
-                            + k * revenue_stats["std"]
-                        )
-                    else:
-                        rev_growth = (
-                            revenue_stats["mean"]
-                            - k * revenue_stats["std"]
-                        )
-
+                for scenario_name, rev_growth in [
+                    ("base", revenue_stats["mean"]),
+                    (
+                        "optimistic",
+                        revenue_stats["mean"] + k * revenue_stats["std"],
+                    ),
+                    (
+                        "pessimistic",
+                        revenue_stats["mean"] - k * revenue_stats["std"],
+                    ),
+                ]:
                     rates, values = _project_negative_fcf(
                         current_value=current_value,
                         revenue_growth_mean=rev_growth,
@@ -292,26 +461,39 @@ def project_growth(
                         g_eq_q=g_eq_q,
                         fade_lambda=fade_lambda,
                     )
-                else:
-                    rates = _fade_growth_rates(
-                        g_start, g_eq_q, fade_lambda, n_quarters,
+                    final_value = values[-1] if values else current_value
+                    annual_cagr = _compute_annual_cagr(
+                        current_value, final_value, period_years,
                     )
-                    values = _project_values(current_value, rates)
-
-                final_value = values[-1] if values else current_value
-                annual_cagr = _compute_annual_cagr(
-                    current_value, final_value, period_years,
+                    scenarios[scenario_name] = Projection(
+                        entity_id=entity_id,
+                        metric=metric,
+                        period_years=period_years,
+                        scenario=scenario_name,
+                        quarterly_growth_rates=rates,
+                        quarterly_values=values,
+                        annual_cagr=annual_cagr,
+                        current_value=current_value,
+                    )
+            else:
+                # Positive FCF or revenue: Monte Carlo simulation
+                final_values = _simulate_monte_carlo(
+                    current_value=current_value,
+                    growth_mean=stats["mean"],
+                    growth_std=stats["std"],
+                    market_cap=market_cap,
+                    n_quarters=n_quarters,
+                    metric=metric,
+                    config=config,
+                    seed=seed,
                 )
-
-                scenarios[scenario_name] = Projection(
+                scenarios = _extract_scenarios(
                     entity_id=entity_id,
                     metric=metric,
                     period_years=period_years,
-                    scenario=scenario_name,
-                    quarterly_growth_rates=rates,
-                    quarterly_values=values,
-                    annual_cagr=annual_cagr,
                     current_value=current_value,
+                    final_values=final_values,
+                    n_quarters=n_quarters,
                 )
 
             period_result[metric] = scenarios

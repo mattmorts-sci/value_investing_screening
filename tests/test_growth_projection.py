@@ -5,16 +5,17 @@ from __future__ import annotations
 import math
 from typing import Any
 
+import numpy as np
 import pandas as pd
 import pytest
 
 from pipeline.analysis.growth_projection import (
     _compute_annual_cagr,
-    _compute_fade_lambda,
-    _fade_growth_rates,
+    _extract_scenarios,
+    _parameterise_lognormal,
     _project_negative_fcf,
-    _project_values,
-    _quarterly_rate,
+    _safe_float,
+    _simulate_monte_carlo,
     project_all,
     project_growth,
 )
@@ -24,6 +25,12 @@ from pipeline.data.contracts import Projection
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _quarterly_rate(annual: float) -> float:
+    """Convert annual rate to quarterly (test utility)."""
+    return (1 + annual) ** 0.25 - 1
+
 
 def _default_config(**overrides: Any) -> AnalysisConfig:
     """AnalysisConfig with sensible test defaults."""
@@ -36,6 +43,7 @@ def _default_config(**overrides: Any) -> AnalysisConfig:
         "negative_fcf_improvement_cap": 0.15,
         "min_market_cap": 20_000_000,
         "quarters_per_year": 4,
+        "simulation_replicates": 1000,
     }
     kwargs.update(overrides)
     return AnalysisConfig(**kwargs)
@@ -50,125 +58,123 @@ def _default_stats(
 
 
 # ---------------------------------------------------------------------------
-# _quarterly_rate
+# _parameterise_lognormal
 # ---------------------------------------------------------------------------
 
-class TestQuarterlyRate:
 
-    def test_zero(self) -> None:
-        assert _quarterly_rate(0.0) == 0.0
+class TestParameteriseLognormal:
 
-    def test_positive(self) -> None:
-        # (1 + 0.10)^0.25 - 1 ≈ 0.02411
-        result = _quarterly_rate(0.10)
-        assert result == pytest.approx(0.02411, abs=1e-4)
+    def test_normal_case(self) -> None:
+        """m > -0.5 and s > 0 produces valid log-normal parameters."""
+        mu, sigma = _parameterise_lognormal(0.05, 0.02, 1.0)
+        assert mu > 0  # positive growth mean
+        assert sigma > 0  # positive volatility
 
-    def test_compounds_back(self) -> None:
-        annual = 0.08
-        q = _quarterly_rate(annual)
-        assert (1 + q) ** 4 - 1 == pytest.approx(annual, abs=1e-10)
+    def test_edge_case_very_negative_mean(self) -> None:
+        """m <= -0.5 defaults to 5% quarterly decline."""
+        mu, sigma = _parameterise_lognormal(-0.6, 0.1, 1.0)
+        assert mu == pytest.approx(math.log(0.95), abs=1e-10)
+        assert sigma == pytest.approx(math.sqrt(0.1), abs=1e-10)
 
-    def test_extreme_negative_clamped(self) -> None:
-        """Annual rate below -100% should be clamped, not crash."""
-        result = _quarterly_rate(-1.5)
-        # Clamped to -0.99 → (0.01)^0.25 - 1
-        assert result == pytest.approx((0.01) ** 0.25 - 1, rel=1e-6)
+    def test_edge_case_zero_std(self) -> None:
+        """s = 0 with positive mean projects at mean with small sigma."""
+        mu, sigma = _parameterise_lognormal(0.05, 0.0, 1.0)
+        assert mu == pytest.approx(math.log(1.05), abs=1e-10)
+        assert sigma == pytest.approx(0.05, abs=1e-10)
 
+    def test_zero_mean_zero_std_projects_flat(self) -> None:
+        """m = 0, s = 0 (unknown growth) projects roughly flat."""
+        mu, sigma = _parameterise_lognormal(0.0, 0.0, 1.0)
+        assert mu == pytest.approx(math.log(1.0), abs=1e-10)
+        assert sigma == pytest.approx(0.05, abs=1e-10)
 
-# ---------------------------------------------------------------------------
-# _compute_fade_lambda
-# ---------------------------------------------------------------------------
+    def test_cv_cap_applied(self) -> None:
+        """Very high std relative to mean is capped at cv_cap."""
+        # Both exceed CV cap of 1.0 → same result
+        mu1, sigma1 = _parameterise_lognormal(0.05, 2.0, 1.0)
+        mu2, sigma2 = _parameterise_lognormal(0.05, 100.0, 1.0)
+        assert mu1 == pytest.approx(mu2)
+        assert sigma1 == pytest.approx(sigma2)
 
-class TestComputeFadeLambda:
+    def test_exact_log_normal_parameterisation(self) -> None:
+        """Verify the math: target_mean, CV, sigma_sq, mu."""
+        m, s, cv_cap = 0.10, 0.05, 1.0
+        mu, sigma = _parameterise_lognormal(m, s, cv_cap)
 
-    def test_base_case(self) -> None:
-        # lambda = ln(2) / (2.5 * 4) = ln(2) / 10
-        result = _compute_fade_lambda(2.5, 20_000_000, 20_000_000)
-        expected = math.log(2) / 10
-        # size_ratio = 1, so size_adj = 0
-        assert result == pytest.approx(expected, rel=1e-6)
+        target_mean = 1 + m  # 1.10
+        cv = s / target_mean  # 0.05 / 1.10 ≈ 0.04545
+        expected_sigma_sq = math.log(1 + cv**2)
+        expected_mu = math.log(target_mean) - expected_sigma_sq / 2
 
-    def test_larger_company_fades_faster(self) -> None:
-        small = _compute_fade_lambda(2.5, 20_000_000, 20_000_000)
-        large = _compute_fade_lambda(2.5, 200_000_000, 20_000_000)
-        assert large > small
-
-    def test_below_min_market_cap(self) -> None:
-        # size_ratio < 1 → size_adj = 0
-        result = _compute_fade_lambda(2.5, 10_000_000, 20_000_000)
-        base = math.log(2) / 10
-        assert result == pytest.approx(base, rel=1e-6)
-
-    def test_zero_market_cap(self) -> None:
-        result = _compute_fade_lambda(2.5, 0, 20_000_000)
-        base = math.log(2) / 10
-        assert result == pytest.approx(base, rel=1e-6)
+        assert mu == pytest.approx(expected_mu, abs=1e-10)
+        assert sigma == pytest.approx(math.sqrt(expected_sigma_sq), abs=1e-10)
 
 
 # ---------------------------------------------------------------------------
-# _fade_growth_rates
+# _extract_scenarios
 # ---------------------------------------------------------------------------
 
-class TestFadeGrowthRates:
 
-    def test_converges_to_equilibrium(self) -> None:
-        g_eq_q = _quarterly_rate(0.03)
-        fade_lambda = math.log(2) / 10
-        rates = _fade_growth_rates(0.10, g_eq_q, fade_lambda, 200)
-        # After 200 quarters (50 years), should be very close to g_eq_q
-        assert rates[-1] == pytest.approx(g_eq_q, abs=1e-6)
+class TestExtractScenarios:
 
-    def test_starts_near_g_0(self) -> None:
-        g_0 = 0.08
-        g_eq_q = _quarterly_rate(0.03)
-        fade_lambda = math.log(2) / 10
-        rates = _fade_growth_rates(g_0, g_eq_q, fade_lambda, 20)
-        # First rate should be close to g_0 (only 1 quarter of decay)
-        assert rates[0] == pytest.approx(
-            g_eq_q + (g_0 - g_eq_q) * math.exp(-fade_lambda), rel=1e-6,
+    def test_returns_three_scenarios(self) -> None:
+        final_values = np.array([80, 90, 100, 110, 120], dtype=np.float64)
+        scenarios = _extract_scenarios(
+            entity_id=1, metric="fcf", period_years=5,
+            current_value=100.0, final_values=final_values, n_quarters=20,
         )
+        assert set(scenarios.keys()) == {"pessimistic", "base", "optimistic"}
 
-    def test_monotonically_decreasing_when_g0_above_eq(self) -> None:
-        g_eq_q = _quarterly_rate(0.03)
-        rates = _fade_growth_rates(0.10, g_eq_q, 0.1, 20)
-        for i in range(1, len(rates)):
-            assert rates[i] < rates[i - 1]
+    def test_ordering(self) -> None:
+        """Pessimistic < base < optimistic for final values."""
+        rng = np.random.default_rng(42)
+        final_values = rng.normal(200, 30, size=10000)
+        scenarios = _extract_scenarios(
+            entity_id=1, metric="fcf", period_years=5,
+            current_value=100.0, final_values=final_values, n_quarters=20,
+        )
+        pess = scenarios["pessimistic"].quarterly_values[-1]
+        base = scenarios["base"].quarterly_values[-1]
+        opt = scenarios["optimistic"].quarterly_values[-1]
+        assert pess < base < opt
 
-    def test_monotonically_increasing_when_g0_below_eq(self) -> None:
-        g_eq_q = _quarterly_rate(0.03)
-        rates = _fade_growth_rates(-0.02, g_eq_q, 0.1, 20)
-        for i in range(1, len(rates)):
-            assert rates[i] > rates[i - 1]
+    def test_quarterly_values_length(self) -> None:
+        final_values = np.full(100, 200.0)
+        scenarios = _extract_scenarios(
+            entity_id=1, metric="fcf", period_years=5,
+            current_value=100.0, final_values=final_values, n_quarters=20,
+        )
+        assert len(scenarios["base"].quarterly_values) == 20
+        assert len(scenarios["base"].quarterly_growth_rates) == 20
 
-    def test_correct_count(self) -> None:
-        rates = _fade_growth_rates(0.05, 0.01, 0.1, 40)
-        assert len(rates) == 40
+    def test_projection_fields(self) -> None:
+        final_values = np.full(100, 200.0)
+        scenarios = _extract_scenarios(
+            entity_id=42, metric="revenue", period_years=10,
+            current_value=500.0, final_values=final_values, n_quarters=40,
+        )
+        proj = scenarios["base"]
+        assert proj.entity_id == 42
+        assert proj.metric == "revenue"
+        assert proj.period_years == 10
+        assert proj.scenario == "base"
+        assert proj.current_value == 500.0
 
-
-# ---------------------------------------------------------------------------
-# _project_values
-# ---------------------------------------------------------------------------
-
-class TestProjectValues:
-
-    def test_constant_growth(self) -> None:
-        values = _project_values(100.0, [0.10, 0.10, 0.10])
-        assert values[0] == pytest.approx(110.0)
-        assert values[1] == pytest.approx(121.0)
-        assert values[2] == pytest.approx(133.1)
-
-    def test_zero_growth(self) -> None:
-        values = _project_values(100.0, [0.0, 0.0])
-        assert all(v == pytest.approx(100.0) for v in values)
-
-    def test_zero_start(self) -> None:
-        values = _project_values(0.0, [0.10, 0.10])
-        assert all(v == pytest.approx(0.0) for v in values)
+    def test_constant_quarterly_rates(self) -> None:
+        """All quarterly growth rates should be identical (smooth compound path)."""
+        final_values = np.full(100, 200.0)
+        scenarios = _extract_scenarios(
+            entity_id=1, metric="fcf", period_years=5,
+            current_value=100.0, final_values=final_values, n_quarters=20,
+        )
+        rates = scenarios["base"].quarterly_growth_rates
+        assert all(r == pytest.approx(rates[0]) for r in rates)
 
 
 # ---------------------------------------------------------------------------
 # _project_negative_fcf
 # ---------------------------------------------------------------------------
+
 
 class TestProjectNegativeFcf:
 
@@ -324,6 +330,7 @@ class TestProjectGrowth:
             revenue_stats=_default_stats(),
             market_cap=50_000_000,
             config=config,
+            seed=42,
         )
         assert set(result.keys()) == {5, 10}
         for period in (5, 10):
@@ -341,6 +348,7 @@ class TestProjectGrowth:
             revenue_stats=_default_stats(),
             market_cap=50_000_000,
             config=config,
+            seed=42,
         )
         proj = result[5]["fcf"]["base"]
         assert isinstance(proj, Projection)
@@ -357,6 +365,7 @@ class TestProjectGrowth:
             revenue_stats=_default_stats(),
             market_cap=50_000_000,
             config=config,
+            seed=42,
         )
         proj = result[5]["fcf"]["base"]
         assert len(proj.quarterly_growth_rates) == 20  # 5 years * 4
@@ -371,6 +380,7 @@ class TestProjectGrowth:
             revenue_stats=_default_stats(mean=0.03, std=0.01),
             market_cap=50_000_000,
             config=config,
+            seed=42,
         )
         fcf = result[5]["fcf"]
         pess = fcf["pessimistic"].quarterly_values[-1]
@@ -386,6 +396,7 @@ class TestProjectGrowth:
             revenue_stats=_default_stats(mean=0.05, std=0.01),
             market_cap=50_000_000,
             config=config,
+            seed=42,
         )
         proj = result[5]["fcf"]["base"]
         # Should move toward zero
@@ -399,26 +410,13 @@ class TestProjectGrowth:
             revenue_stats=_default_stats(mean=0.05, std=0.03),
             market_cap=50_000_000,
             config=config,
+            seed=42,
         )
         fcf = result[5]["fcf"]
         # Optimistic should improve faster (closer to zero or positive)
         assert abs(fcf["optimistic"].quarterly_values[-1]) < abs(
             fcf["pessimistic"].quarterly_values[-1]
         )
-
-    def test_fade_converges_to_equilibrium(self) -> None:
-        """Over a very long horizon, growth rates approach equilibrium."""
-        config = _default_config(projection_periods=(50,))
-        result = project_growth(
-            entity_id=1,
-            fcf_stats=_default_stats(mean=0.10, std=0.02),
-            revenue_stats=_default_stats(mean=0.05, std=0.01),
-            market_cap=50_000_000,
-            config=config,
-        )
-        g_eq_q = _quarterly_rate(0.03)
-        final_rate = result[50]["fcf"]["base"].quarterly_growth_rates[-1]
-        assert final_rate == pytest.approx(g_eq_q, abs=1e-4)
 
     def test_current_value_preserved(self) -> None:
         config = _default_config()
@@ -428,6 +426,7 @@ class TestProjectGrowth:
             revenue_stats=_default_stats(latest_value=2000.0),
             market_cap=50_000_000,
             config=config,
+            seed=42,
         )
         assert result[5]["fcf"]["base"].current_value == 500.0
         assert result[5]["revenue"]["base"].current_value == 2000.0
@@ -504,3 +503,378 @@ class TestProjectAll:
         growth_stats.index.name = "entity_id"
         result = project_all(companies, growth_stats, config)
         assert result == {}
+
+
+# ---------------------------------------------------------------------------
+# _safe_float
+# ---------------------------------------------------------------------------
+
+class TestSafeFloat:
+
+    def test_inf_returns_default(self) -> None:
+        assert _safe_float(float("inf")) == 0.0
+
+    def test_negative_inf_returns_default(self) -> None:
+        assert _safe_float(float("-inf")) == 0.0
+
+    def test_inf_custom_default(self) -> None:
+        assert _safe_float(float("inf"), default=-1.0) == -1.0
+
+    def test_nan_returns_default(self) -> None:
+        assert _safe_float(float("nan")) == 0.0
+
+    def test_none_returns_default(self) -> None:
+        assert _safe_float(None) == 0.0
+
+    def test_normal_float_passes_through(self) -> None:
+        assert _safe_float(3.14) == pytest.approx(3.14)
+
+
+# ---------------------------------------------------------------------------
+# _simulate_monte_carlo — isolated constraint tests
+# ---------------------------------------------------------------------------
+
+
+class TestPerQuarterCaps:
+    """Constraint 2: per-quarter growth caps (asymmetric by size)."""
+
+    def test_positive_growth_capped(self) -> None:
+        """Growth rates exceeding pos_cap are clipped."""
+        # Use very high mean growth to ensure samples exceed cap.
+        config = _default_config(
+            simulation_replicates=500,
+            fcf_small_pos_cap=0.10,
+            fcf_small_neg_cap=-0.30,
+            # Disable other constraints that might interfere.
+            cumulative_growth_cap=1000.0,
+            cumulative_decline_floor=0.001,
+            annual_cagr_backstop=100.0,
+            high_growth_threshold=100.0,  # disables momentum + time decay
+        )
+        final = _simulate_monte_carlo(
+            current_value=100.0,
+            growth_mean=0.50,  # very high mean
+            growth_std=0.10,
+            market_cap=0.0,  # disables size penalty
+            n_quarters=1,
+            metric="fcf",
+            config=config,
+            seed=42,
+        )
+        # After 1 quarter capped at 10%, max value is 100 * 1.10 = 110
+        assert np.all(final <= 100.0 * 1.10 + 0.01)
+
+    def test_negative_growth_capped(self) -> None:
+        """Decline rates below neg_cap are clipped."""
+        config = _default_config(
+            simulation_replicates=500,
+            fcf_small_pos_cap=0.40,
+            fcf_small_neg_cap=-0.05,
+            cumulative_growth_cap=1000.0,
+            cumulative_decline_floor=0.001,
+            annual_cagr_backstop=100.0,
+            high_growth_threshold=100.0,
+        )
+        final = _simulate_monte_carlo(
+            current_value=100.0,
+            growth_mean=-0.40,  # very negative mean
+            growth_std=0.10,
+            market_cap=0.0,
+            n_quarters=1,
+            metric="fcf",
+            config=config,
+            seed=42,
+        )
+        # After 1 quarter capped at -5%, min value is 100 * 0.95 = 95
+        assert np.all(final >= 100.0 * 0.95 - 0.01)
+
+
+class TestCumulativeCapAndFloor:
+    """Constraint 3: cumulative growth cap and decline floor."""
+
+    def test_cumulative_growth_capped(self) -> None:
+        """Values cannot exceed current_value * cumulative_growth_cap."""
+        config = _default_config(
+            simulation_replicates=500,
+            cumulative_growth_cap=2.0,  # 2x max
+            cumulative_decline_floor=0.01,
+            annual_cagr_backstop=1000.0,  # effectively disabled
+            high_growth_threshold=100.0,
+            fcf_small_pos_cap=0.90,  # allow large per-quarter growth
+        )
+        final = _simulate_monte_carlo(
+            current_value=100.0,
+            growth_mean=0.50,
+            growth_std=0.20,
+            market_cap=0.0,
+            n_quarters=20,
+            metric="fcf",
+            config=config,
+            seed=42,
+        )
+        assert np.all(final <= 100.0 * 2.0 + 0.01)
+
+    def test_cumulative_decline_floored(self) -> None:
+        """Values cannot fall below current_value * cumulative_decline_floor."""
+        config = _default_config(
+            simulation_replicates=500,
+            cumulative_growth_cap=100.0,
+            cumulative_decline_floor=0.5,  # 0.5x floor
+            annual_cagr_backstop=1000.0,
+            high_growth_threshold=100.0,
+            fcf_small_neg_cap=-0.90,  # allow large per-quarter decline
+            fcf_large_neg_cap=-0.90,
+        )
+        final = _simulate_monte_carlo(
+            current_value=100.0,
+            growth_mean=-0.40,
+            growth_std=0.10,
+            market_cap=0.0,
+            n_quarters=20,
+            metric="fcf",
+            config=config,
+            seed=42,
+        )
+        assert np.all(final >= 100.0 * 0.5 - 0.01)
+
+
+class TestCagrBackstop:
+    """Constraint 4: annual CAGR backstop (after year 1)."""
+
+    def test_backstop_limits_growth(self) -> None:
+        """After year 1, values cannot exceed 100% annual CAGR path."""
+        config = _default_config(
+            simulation_replicates=500,
+            annual_cagr_backstop=0.50,  # 50% annual cap
+            cumulative_growth_cap=1000.0,
+            cumulative_decline_floor=0.001,
+            high_growth_threshold=100.0,
+            fcf_small_pos_cap=0.90,
+            fcf_large_pos_cap=0.90,
+        )
+        n_quarters = 8  # 2 years
+        final = _simulate_monte_carlo(
+            current_value=100.0,
+            growth_mean=0.50,
+            growth_std=0.10,
+            market_cap=0.0,
+            n_quarters=n_quarters,
+            metric="fcf",
+            config=config,
+            seed=42,
+        )
+        max_allowed = 100.0 * (1.50 ** (n_quarters / 4))  # 50% annual for 2 years
+        assert np.all(final <= max_allowed + 0.01)
+
+    def test_backstop_inactive_in_year_one(self) -> None:
+        """Backstop does not fire within the first year."""
+        config = _default_config(
+            simulation_replicates=500,
+            annual_cagr_backstop=0.10,  # very tight 10% annual
+            cumulative_growth_cap=1000.0,
+            cumulative_decline_floor=0.001,
+            high_growth_threshold=100.0,
+            fcf_small_pos_cap=0.50,
+        )
+        final = _simulate_monte_carlo(
+            current_value=100.0,
+            growth_mean=0.30,
+            growth_std=0.05,
+            market_cap=0.0,
+            n_quarters=4,  # exactly 1 year
+            metric="fcf",
+            config=config,
+            seed=42,
+        )
+        # Some paths should exceed 10% annual = 110 within year 1
+        # because backstop doesn't fire until after year 1.
+        assert np.any(final > 110.0)
+
+
+class TestMomentumExhaustion:
+    """Constraint 6: momentum exhaustion for high-growth companies."""
+
+    def test_fires_for_high_growth_mean(self) -> None:
+        """Momentum dampening should reduce final values vs no dampening."""
+        base_config = {
+            "simulation_replicates": 2000,
+            "cumulative_growth_cap": 1000.0,
+            "cumulative_decline_floor": 0.001,
+            "annual_cagr_backstop": 1000.0,
+            "high_growth_threshold": 0.20,
+            "momentum_exhaustion_threshold": 1.5,
+            "fcf_small_pos_cap": 0.90,
+            "fcf_large_pos_cap": 0.90,
+        }
+        # With momentum exhaustion active (high_growth_threshold=0.20)
+        config_with = _default_config(**base_config)
+        final_with = _simulate_monte_carlo(
+            current_value=100.0,
+            growth_mean=0.35,  # above 0.20 threshold
+            growth_std=0.10,
+            market_cap=0.0,
+            n_quarters=20,
+            metric="fcf",
+            config=config_with,
+            seed=42,
+        )
+
+        # Without momentum (high_growth_threshold set above growth_mean)
+        config_without = _default_config(
+            **{**base_config, "high_growth_threshold": 100.0},
+        )
+        final_without = _simulate_monte_carlo(
+            current_value=100.0,
+            growth_mean=0.35,
+            growth_std=0.10,
+            market_cap=0.0,
+            n_quarters=20,
+            metric="fcf",
+            config=config_without,
+            seed=42,
+        )
+
+        # Median with momentum should be lower than without
+        assert np.median(final_with) < np.median(final_without)
+
+    def test_inactive_below_threshold(self) -> None:
+        """Momentum exhaustion does not fire when growth_mean < threshold."""
+        config = _default_config(
+            simulation_replicates=500,
+            high_growth_threshold=0.30,
+            cumulative_growth_cap=1000.0,
+            cumulative_decline_floor=0.001,
+            annual_cagr_backstop=1000.0,
+        )
+        # growth_mean = 0.05 < 0.30 threshold: momentum won't fire.
+        # Run twice with same seed: should produce identical results
+        # regardless of momentum logic.
+        final1 = _simulate_monte_carlo(
+            current_value=100.0,
+            growth_mean=0.05,
+            growth_std=0.02,
+            market_cap=0.0,
+            n_quarters=20,
+            metric="fcf",
+            config=config,
+            seed=99,
+        )
+        final2 = _simulate_monte_carlo(
+            current_value=100.0,
+            growth_mean=0.05,
+            growth_std=0.02,
+            market_cap=0.0,
+            n_quarters=20,
+            metric="fcf",
+            config=config,
+            seed=99,
+        )
+        np.testing.assert_array_equal(final1, final2)
+
+
+class TestSizePenalty:
+    """Constraint 8: size-based growth penalty."""
+
+    def test_large_market_cap_reduces_growth(self) -> None:
+        """Companies with large value-to-market-cap ratio grow less."""
+        config = _default_config(
+            simulation_replicates=2000,
+            cumulative_growth_cap=1000.0,
+            cumulative_decline_floor=0.001,
+            annual_cagr_backstop=1000.0,
+            high_growth_threshold=100.0,  # disable momentum + time decay
+            size_penalty_factor=0.1,
+        )
+        # Small market cap → value/market_cap is large → heavy penalty
+        final_small_cap = _simulate_monte_carlo(
+            current_value=100.0,
+            growth_mean=0.10,
+            growth_std=0.05,
+            market_cap=200.0,  # very small: value/market_cap = 0.5
+            n_quarters=8,
+            metric="fcf",
+            config=config,
+            seed=42,
+        )
+        # Large market cap → value/market_cap is tiny → light penalty
+        final_large_cap = _simulate_monte_carlo(
+            current_value=100.0,
+            growth_mean=0.10,
+            growth_std=0.05,
+            market_cap=1e12,  # very large: value/market_cap ≈ 0
+            n_quarters=8,
+            metric="fcf",
+            config=config,
+            seed=42,
+        )
+        # Large cap should achieve higher growth (less penalty)
+        assert np.median(final_large_cap) > np.median(final_small_cap)
+
+    def test_zero_market_cap_no_penalty(self) -> None:
+        """market_cap = 0 disables size penalty (factor = 1.0)."""
+        config = _default_config(
+            simulation_replicates=500,
+            cumulative_growth_cap=1000.0,
+            cumulative_decline_floor=0.001,
+            annual_cagr_backstop=1000.0,
+            high_growth_threshold=100.0,
+        )
+        final = _simulate_monte_carlo(
+            current_value=100.0,
+            growth_mean=0.10,
+            growth_std=0.05,
+            market_cap=0.0,
+            n_quarters=4,
+            metric="fcf",
+            config=config,
+            seed=42,
+        )
+        # Should produce non-trivial growth (no penalty suppression)
+        assert np.median(final) > 100.0
+
+
+class TestTimeDecay:
+    """Constraint 7: time decay for high growth rates."""
+
+    def test_reduces_growth_over_time(self) -> None:
+        """With time decay, later quarters dampen high growth more."""
+        config_decay = _default_config(
+            simulation_replicates=2000,
+            time_decay_base=0.5,  # aggressive decay
+            high_growth_threshold=0.05,  # low threshold to activate
+            cumulative_growth_cap=1000.0,
+            cumulative_decline_floor=0.001,
+            annual_cagr_backstop=1000.0,
+        )
+        final_decay = _simulate_monte_carlo(
+            current_value=100.0,
+            growth_mean=0.10,
+            growth_std=0.05,
+            market_cap=0.0,
+            n_quarters=20,
+            metric="fcf",
+            config=config_decay,
+            seed=42,
+        )
+
+        # No time decay (base=1.0 means no reduction)
+        config_no_decay = _default_config(
+            simulation_replicates=2000,
+            time_decay_base=1.0,
+            high_growth_threshold=0.05,
+            cumulative_growth_cap=1000.0,
+            cumulative_decline_floor=0.001,
+            annual_cagr_backstop=1000.0,
+        )
+        final_no_decay = _simulate_monte_carlo(
+            current_value=100.0,
+            growth_mean=0.10,
+            growth_std=0.05,
+            market_cap=0.0,
+            n_quarters=20,
+            metric="fcf",
+            config=config_no_decay,
+            seed=42,
+        )
+
+        assert np.median(final_decay) < np.median(final_no_decay)

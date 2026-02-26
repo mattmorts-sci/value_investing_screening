@@ -41,7 +41,7 @@ class TestNegativeFcfFilter:
              "operating_income": 50, "revenue": 200, "market_cap": 5e7,
              "debt_cash_ratio": 1.0},
         ])
-        config = AnalysisConfig()
+        config = AnalysisConfig(enable_negative_fcf_filter=True)
         result, log = apply_filters(df, config)
 
         assert "GOOD" in result["symbol"].values
@@ -54,7 +54,7 @@ class TestNegativeFcfFilter:
              "operating_income": 50, "revenue": 200, "market_cap": 5e7,
              "debt_cash_ratio": 1.0},
         ])
-        config = AnalysisConfig()
+        config = AnalysisConfig(enable_negative_fcf_filter=True)
         result, _ = apply_filters(df, config)
 
         assert len(result) == 0
@@ -204,6 +204,7 @@ class TestOwnedCompanyBypass:
         config = AnalysisConfig(
             mode="owned",
             owned_companies=["OWNED_BAD"],
+            enable_negative_fcf_filter=True,
         )
         result, log = apply_filters(df, config)
 
@@ -220,6 +221,7 @@ class TestOwnedCompanyBypass:
         config = AnalysisConfig(
             mode="owned",
             owned_companies=["MY_CO"],
+            enable_negative_fcf_filter=True,
         )
         _, log = apply_filters(df, config)
 
@@ -236,7 +238,7 @@ class TestOwnedCompanyBypass:
              "operating_income": 50, "revenue": 200, "market_cap": 5e7,
              "debt_cash_ratio": 1.0},
         ])
-        config = AnalysisConfig(mode="shortlist")
+        config = AnalysisConfig(mode="shortlist", enable_negative_fcf_filter=True)
         result, _ = apply_filters(df, config)
 
         assert len(result) == 0
@@ -313,7 +315,7 @@ class TestMultiFilterReason:
              "operating_income": 50, "revenue": 200, "market_cap": 1e6,
              "debt_cash_ratio": 1.0},
         ])
-        config = AnalysisConfig()
+        config = AnalysisConfig(enable_negative_fcf_filter=True)
         _, log = apply_filters(df, config)
 
         # First filter to catch it is negative_fcf.

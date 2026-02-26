@@ -8,7 +8,7 @@ import pytest
 
 from pipeline.analysis.growth_stats import (
     _calculate_cagr,
-    _compute_ttm_growth,
+    _compute_raw_qoq_growth,
     compute_growth_statistics,
 )
 from pipeline.config.settings import AnalysisConfig
@@ -86,60 +86,68 @@ class TestCalculateCagr:
 
 
 # ---------------------------------------------------------------------------
-# TTM growth unit tests
+# Raw QoQ growth unit tests
 # ---------------------------------------------------------------------------
 
 
-class TestComputeTtmGrowth:
-    """TTM rolling-sum growth computation."""
+class TestComputeRawQoqGrowth:
+    """Raw quarter-over-quarter growth computation."""
 
     def test_constant_quarterly_growth(self) -> None:
-        """With constant quarterly growth g, TTM growth equals g exactly.
-
-        Proof: if FCF(t) = V * (1+g)^t, then
-        TTM(t) = V * (1+g)^(t-3) * [1 + (1+g) + (1+g)^2 + (1+g)^3]
-        TTM(t+1) / TTM(t) = (1+g), so TTM growth = g.
-        """
+        """With constant quarterly growth g, every QoQ rate equals g."""
         g = 0.05
         values = pd.Series([100 * (1 + g) ** i for i in range(10)])
-        ttm_growth = _compute_ttm_growth(values)
-        valid = ttm_growth.dropna()
+        qoq_growth = _compute_raw_qoq_growth(values)
+        valid = qoq_growth.dropna()
 
-        # 10 periods: TTM from idx 3-9, growth from idx 4-9 = 6 values
-        assert len(valid) == 6
+        # 10 periods → 9 QoQ values (first is NaN from shift)
+        assert len(valid) == 9
         for v in valid:
             assert v == pytest.approx(g, abs=1e-10)
 
-    def test_insufficient_periods(self) -> None:
-        """Fewer than 5 periods produces no valid TTM growth."""
-        values = pd.Series([100, 105, 110, 115])
-        ttm_growth = _compute_ttm_growth(values)
-        assert ttm_growth.dropna().empty
-
-    def test_exactly_five_periods(self) -> None:
-        """5 periods produces exactly 1 TTM growth observation."""
-        values = pd.Series([100, 110, 120, 130, 140])
-        ttm_growth = _compute_ttm_growth(values)
-        valid = ttm_growth.dropna()
+    def test_two_periods_gives_one_observation(self) -> None:
+        """Minimum input: 2 periods produces 1 QoQ rate."""
+        values = pd.Series([100, 110])
+        qoq_growth = _compute_raw_qoq_growth(values)
+        valid = qoq_growth.dropna()
         assert len(valid) == 1
+        assert valid.iloc[0] == pytest.approx(0.10, abs=1e-10)
+
+    def test_single_period_gives_no_observations(self) -> None:
+        values = pd.Series([100])
+        qoq_growth = _compute_raw_qoq_growth(values)
+        assert qoq_growth.dropna().empty
 
     def test_zero_denominator_produces_nan(self) -> None:
-        """If TTM sum is zero, growth is NaN (not inf)."""
-        # Quarters sum to zero: 100, -100, 100, -100
-        values = pd.Series([100, -100, 100, -100, 50, 50, 50, 50])
-        ttm_growth = _compute_ttm_growth(values)
-        # TTM(3) = 100 - 100 + 100 - 100 = 0, so growth at idx 4
-        # involves dividing by |0| → NaN
-        assert pd.isna(ttm_growth.iloc[4])
+        """If previous quarter's value is zero, QoQ rate is NaN."""
+        values = pd.Series([100, 0, 50])
+        qoq_growth = _compute_raw_qoq_growth(values)
+        # QoQ at index 1: (0 - 100) / |100| = -1.0 (valid)
+        # QoQ at index 2: (50 - 0) / |0| = inf → NaN
+        assert qoq_growth.iloc[1] == pytest.approx(-1.0)
+        assert pd.isna(qoq_growth.iloc[2])
 
-    def test_negative_values(self) -> None:
-        """TTM growth works with negative FCF values."""
-        # FCF improving from -200 toward 0
-        values = pd.Series([-200, -180, -160, -140, -120, -100, -80, -60])
-        ttm_growth = _compute_ttm_growth(values)
-        valid = ttm_growth.dropna()
-        # All growth values should be positive (less negative = growth)
+    def test_negative_values_improving(self) -> None:
+        """FCF improving from negative toward zero: QoQ rates are positive."""
+        values = pd.Series([-200, -180, -160, -140])
+        qoq_growth = _compute_raw_qoq_growth(values)
+        valid = qoq_growth.dropna()
+        # g = (Q_t - Q_{t-1}) / |Q_{t-1}|
+        # g_1 = (-180 - (-200)) / |-200| = 20/200 = 0.10
         assert all(v > 0 for v in valid)
+
+    def test_sign_transition(self) -> None:
+        """Absolute-value denominator handles sign transitions."""
+        values = pd.Series([-100, -50, 50, 100])
+        qoq_growth = _compute_raw_qoq_growth(values)
+        valid = qoq_growth.dropna()
+        # g_1 = (-50 - (-100)) / |-100| = 50/100 = 0.5
+        # g_2 = (50 - (-50)) / |-50| = 100/50 = 2.0
+        # g_3 = (100 - 50) / |50| = 50/50 = 1.0
+        assert len(valid) == 3
+        assert valid.iloc[0] == pytest.approx(0.5)
+        assert valid.iloc[1] == pytest.approx(2.0)
+        assert valid.iloc[2] == pytest.approx(1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -158,7 +166,7 @@ def _make_growth_data(
     """Build a multi-period DataFrame for one company with constant growth.
 
     Generates absolute FCF and revenue values from a base value and
-    constant quarterly growth rate. 10 periods (default) yields 6 TTM
+    constant quarterly growth rate. 10 periods (default) yields 9 QoQ
     growth observations, well above the minimum of 3.
     """
     rows = []
@@ -220,9 +228,9 @@ class TestComputeGrowthStatistics:
         assert result.loc[1, "growth_stability"] == pytest.approx(1.0, abs=1e-9)
 
     def test_growth_stability_with_variance(self) -> None:
-        """Variable FCF/revenue produces non-zero TTM growth std."""
+        """Variable FCF/revenue produces non-zero QoQ growth std."""
         config = AnalysisConfig()
-        # 10 periods with alternating high/low quarters to create TTM variance.
+        # 10 periods with alternating high/low quarters to create variance.
         fcf_values = [100, 120, 90, 130, 110, 140, 95, 135, 115, 145]
         rev_values = [1000, 1050, 980, 1070, 1040, 1100, 990, 1080, 1060, 1120]
         data = pd.DataFrame({
@@ -233,10 +241,8 @@ class TestComputeGrowthStatistics:
         })
         result = compute_growth_statistics(data, config)
 
-        # TTM growth should have non-zero variance from the alternating pattern.
         assert result.loc[1, "fcf_growth_std"] > 0  # type: ignore[operator]
         assert result.loc[1, "revenue_growth_std"] > 0  # type: ignore[operator]
-        # Stability should be < 1.0 when std > 0.
         assert result.loc[1, "growth_stability"] < 1.0  # type: ignore[operator]
 
     def test_cagr_computed_from_absolute_values(self) -> None:
@@ -252,24 +258,23 @@ class TestComputeGrowthStatistics:
 
 
 class TestMinDataPoints:
-    """Behaviour with insufficient data for TTM growth computation."""
+    """Behaviour with insufficient data for QoQ growth computation."""
 
     def test_few_periods_defaults_to_zero(self) -> None:
-        """Fewer than 8 periods yields < 3 TTM growth points → defaults to 0."""
+        """3 periods yields 2 QoQ growth points → below minimum of 3."""
         config = AnalysisConfig()
-        # 6 periods: TTM at idx 3-5, growth at idx 4-5 = 2 observations < 3
-        data = _make_growth_data(n_periods=6)
+        data = _make_growth_data(n_periods=3)
         result = compute_growth_statistics(data, config)
 
         assert result.loc[1, "fcf_growth_mean"] == 0.0
         assert result.loc[1, "fcf_growth_var"] == 0.0
         assert result.loc[1, "fcf_growth_std"] == 0.0
 
-    def test_nan_absolute_values_reduce_ttm_count(self) -> None:
-        """NaN in absolute values propagates through TTM, reducing valid count."""
+    def test_nan_absolute_values_reduce_qoq_count(self) -> None:
+        """NaN in absolute values propagates to QoQ, reducing valid count."""
         config = AnalysisConfig()
-        # 10 periods, but NaN in fcf at idx 2 and 5 kills TTM windows
-        # that include those quarters.
+        # 10 periods, but NaN in fcf at idx 2 and 5.
+        # Each NaN kills two QoQ values (the NaN quarter and the next).
         fcf = [100.0] * 10
         fcf[2] = np.nan
         fcf[5] = np.nan
@@ -281,12 +286,11 @@ class TestMinDataPoints:
         })
         result = compute_growth_statistics(data, config)
 
-        # FCF TTM is NaN for windows containing idx 2 (TTM idx 2-5)
-        # and idx 5 (TTM idx 5-8). Revenue is unaffected.
+        # Revenue is unaffected by FCF NaN.
         assert result.loc[1, "revenue_growth_mean"] != 0.0
 
     def test_very_short_series_defaults_to_zero(self) -> None:
-        """Only 2 periods: no TTM possible → defaults to 0."""
+        """2 periods: only 1 QoQ value → below minimum of 3."""
         config = AnalysisConfig()
         data = pd.DataFrame({
             "entity_id": [1, 1],
