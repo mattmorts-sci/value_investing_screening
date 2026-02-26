@@ -123,4 +123,5 @@ Preparing to refactor legacy code. Legacy code is in `LEGACY/`.
 - Never create a config parameter derivable from an existing one.
 - No sycophancy. Assess independently; disagree with reasoning when warranted.
 - Direct, factual language. No hedging, no filler.
-- After user has given direction backbrief BEFORE starting a task
+- After user has given direction backbrief, wait for user approaval BEFORE starting a task
+- Documentation records what IS, not what ISN'T. Do not document excluded options, or how its changed from a previous version.

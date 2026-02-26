@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>{{ title }}</title>
+<style>
+  @page {
+    size: A4 landscape;
+    margin: 1.5cm;
+  }
+  body {
+    font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+    font-size: 11pt;
+    color: #333;
+    line-height: 1.4;
+  }
+  h1 { font-size: 22pt; margin-top: 0; color: #1a1a2e; }
+  h2 { font-size: 16pt; color: #16213e; border-bottom: 2px solid #0f3460; padding-bottom: 4px; }
+  h3 { font-size: 13pt; color: #16213e; }
+  .title-page {
+    text-align: center;
+    padding-top: 6cm;
+    page-break-after: always;
+  }
+  .title-page h1 { font-size: 28pt; }
+  .title-page .subtitle { font-size: 16pt; color: #555; margin-top: 0.5cm; }
+  .title-page .date { font-size: 12pt; color: #777; margin-top: 1cm; }
+  .title-page .params { font-size: 10pt; color: #555; margin-top: 1.5cm; text-align: left; display: inline-block; }
+  .section { page-break-before: always; }
+  .chart-container { text-align: center; margin: 0.5cm 0; }
+  .chart-container img { max-width: 100%; max-height: 16cm; }
+  .summary-box {
+    background: #f8f9fa;
+    border: 1px solid #dee2e6;
+    border-radius: 4px;
+    padding: 0.5cm;
+    margin: 0.3cm 0;
+  }
+  .summary-box ul { margin: 0.2cm 0; padding-left: 1cm; }
+  .two-col { display: flex; gap: 1cm; }
+  .two-col > div { flex: 1; }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    font-size: 9pt;
+    margin: 0.3cm 0;
+  }
+  th, td { border: 1px solid #dee2e6; padding: 4px 6px; text-align: center; }
+  th { background: #31688e; color: white; font-weight: bold; }
+  tr:nth-child(even) { background: #f8f9fa; }
+  .company-page { page-break-before: always; }
+  .company-page h2 { border-color: #31688e; }
+  .chart-grid { display: flex; flex-wrap: wrap; gap: 0.3cm; justify-content: center; }
+  .chart-grid .chart-container { flex: 0 0 48%; }
+</style>
+</head>
+<body>
+
+{# ===== TITLE PAGE ===== #}
+<div class="title-page">
+  <h1>Intrinsic Value Analysis Report</h1>
+  <div class="subtitle">{{ market }} Market Analysis</div>
+  <div class="date">Analysis Date: {{ analysis_date }}</div>
+  <div class="params">
+    <strong>Key Parameters:</strong><br>
+    Projection Period: {{ primary_period }} years |
+    Discount Rate: {{ discount_rate }} |
+    Margin of Safety: {{ margin_of_safety }} |
+    Terminal Growth: {{ terminal_growth_rate }}<br>
+    Valuation: FCF-based DCF only (revenue tracked separately for growth analysis)
+  </div>
+</div>
+
+{# ===== EXECUTIVE SUMMARY ===== #}
+<div class="section">
+  <h2>Executive Summary</h2>
+  <div class="summary-box">
+    <ul>
+      <li>Companies analysed: {{ company_count }}</li>
+      <li>Companies after filtering: {{ filtered_count }}</li>
+      <li>Companies with live prices: {{ priced_count }}</li>
+      <li>Watchlist size: {{ watchlist_size }}</li>
+      <li>Detailed reports: {{ detailed_count }} companies</li>
+    </ul>
+  </div>
+  {% if filter_chart %}
+  <div class="chart-container">
+    <img src="data:image/png;base64,{{ filter_chart }}" alt="Filter summary">
+  </div>
+  {% endif %}
+</div>
+
+{# ===== MARKET OVERVIEW ===== #}
+<div class="section">
+  <h2>Market Overview</h2>
+  {% for chart in market_charts %}
+  <div class="chart-container">
+    <img src="data:image/png;base64,{{ chart }}" alt="Market overview chart">
+  </div>
+  {% if not loop.last %}<div style="page-break-before: always;"></div>{% endif %}
+  {% endfor %}
+</div>
+
+{# ===== COMPARATIVE ANALYSIS ===== #}
+<div class="section">
+  <h2>Comparative Analysis</h2>
+  {% for chart in comparative_charts %}
+  <div class="chart-container">
+    <img src="data:image/png;base64,{{ chart }}" alt="Comparative chart">
+  </div>
+  {% if not loop.last %}<div style="page-break-before: always;"></div>{% endif %}
+  {% endfor %}
+</div>
+
+{# ===== COMPANY DETAIL PAGES ===== #}
+{% for company in detailed_companies %}
+<div class="company-page">
+  <h2>{{ company.symbol }} — {{ company.name }}</h2>
+  <div class="chart-grid">
+    {% for chart in company.charts %}
+    <div class="chart-container">
+      <img src="data:image/png;base64,{{ chart }}" alt="{{ company.symbol }} chart">
+    </div>
+    {% endfor %}
+  </div>
+</div>
+{% endfor %}
+
+{# ===== WATCHLIST SUMMARY ===== #}
+{% if watchlist_chart %}
+<div class="section">
+  <h2>Watchlist Summary</h2>
+  <div class="chart-container">
+    <img src="data:image/png;base64,{{ watchlist_chart }}" alt="Watchlist summary">
+  </div>
+</div>
+{% endif %}
+
+{# ===== FULL RANKINGS ===== #}
+{% if rankings_chart %}
+<div class="section">
+  <h2>Full Rankings</h2>
+  <div class="chart-container">
+    <img src="data:image/png;base64,{{ rankings_chart }}" alt="Full rankings">
+  </div>
+</div>
+{% endif %}
+
+</body>
+</html>
