@@ -105,11 +105,11 @@ def historical_growth(results: AnalysisResults, entity_id: int) -> Figure:
     ax.bar(x - width / 2, fcf_display, width, label="FCF Growth", color=_C0)
     ax.bar(x + width / 2, rev_display, width, label="Revenue Growth", color=_C1)
 
-    ax.set_xlabel("Period Index")
+    ax.set_xlabel("Year")
     ax.set_ylabel("Growth Rate (%)")
-    ax.set_title(f"{symbol} — Historical Quarterly Growth")
+    ax.set_title(f"{symbol} — Historical Growth")
     ax.set_xticks(x)
-    ax.set_xticklabels([str(int(p)) for p in periods], rotation=45, ha="right")
+    ax.set_xticklabels([f"{p / 4:.1f}" for p in periods], rotation=45, ha="right")
     ax.axhline(y=0, color="grey", linewidth=0.8, linestyle="-")
     ax.legend()
 
@@ -170,11 +170,12 @@ def growth_projection(results: AnalysisResults, entity_id: int) -> Figure:
             continue
 
         quarters = np.arange(len(base.quarterly_values))
+        years = quarters / 4
         base_vals = np.array(base.quarterly_values) / 1e6
 
         colour = _C0 if idx == 0 else _C1
         ax.plot(
-            quarters, base_vals,
+            years, base_vals,
             color=colour, linewidth=2,
             label=f"Base (CAGR {base.annual_cagr * 100:.1f}%)",
         )
@@ -183,7 +184,7 @@ def growth_projection(results: AnalysisResults, entity_id: int) -> Figure:
             pess_vals = np.array(pess.quarterly_values) / 1e6
             opt_vals = np.array(opt.quarterly_values) / 1e6
             ax.fill_between(
-                quarters, pess_vals, opt_vals,
+                years, pess_vals, opt_vals,
                 alpha=0.25, color=colour,
                 label=(
                     f"Range: {pess.annual_cagr * 100:.1f}% - "
@@ -191,7 +192,7 @@ def growth_projection(results: AnalysisResults, entity_id: int) -> Figure:
                 ),
             )
 
-        ax.set_xlabel("Quarter")
+        ax.set_xlabel("Year")
         ax.set_ylabel("Value ($M)")
         ax.set_title(metric.upper())
         ax.legend(fontsize=8)

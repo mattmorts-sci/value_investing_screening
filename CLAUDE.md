@@ -36,7 +36,7 @@ The following must be kept up to date:
 ## Compact Instructions
 
 When compacting, preserve:
-- Current task and its mode (solo/build/team)
+- Current task and its mode 
 - Active teammate names and their assignments (if team mode)
 - Unresolved issues and pending decisions
 - Which files have been modified in this session

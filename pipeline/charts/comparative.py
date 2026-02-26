@@ -322,6 +322,10 @@ def acquirers_multiple_analysis(
                             xytext=(0, 6), textcoords="offset points",
                             color="red", fontweight="bold")
 
+    # Reference line at AM = 0
+    ax.axhline(0, color="red", linestyle="--", linewidth=1.5,
+               label="AM = 0 (zero threshold)")
+
     # Reference line at AM = 10
     ax.axhline(10, color="green", linestyle="--", alpha=0.6,
                label="AM = 10 (threshold)")
@@ -338,9 +342,10 @@ def acquirers_multiple_analysis(
     # Custom legend entry for red dot
     red_dot = Line2D([0], [0], marker="o", color="w", markerfacecolor="red",
                      markersize=8, label="Current AM (live price)")
-    ax.legend(handles=[ax.get_legend_handles_labels()[0][0], red_dot],
-              labels=["AM = 10 (threshold)", "Current AM (live price)"],
-              fontsize=8)
+    handles, labels = ax.get_legend_handles_labels()
+    handles.append(red_dot)
+    labels.append("Current AM (live price)")
+    ax.legend(handles=handles, labels=labels, fontsize=8)
 
     fig.tight_layout()
     return fig
