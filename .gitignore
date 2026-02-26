@@ -3,7 +3,14 @@ __pycache__/
 .env
 *.egg-info/
 .venv/
+
+# Dir
 cache/
 output/
+LEGACY/
+
+# Notebooks
 *.ipynb
+
+# Other
 .claude/
