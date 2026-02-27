@@ -307,16 +307,14 @@ If not, add parallelisation.
 
 ### 2. AM chart percentage change always shows "+0%"
 
-**Status:** Root cause identified, fix pending
-**Affects:** `pipeline/charts/comparative.py`, `pipeline/runner.py`
+**Status:** Fixed
 
-`_update_live_metrics` (runner.py:35, overwrite at line 60) replaces
-`adj_close` with the live price in the companies DataFrame before
-results are assembled. The AM chart then reads `acquirers_multiple`
-from this already-updated DataFrame AND computes current AM from the
-same live prices. Identical inputs produce 0% change for every
-company.
+`_update_live_metrics` (runner.py:35) overwrote `acquirers_multiple`
+with live-price-derived values before the chart read it. The chart
+then computed current AM from the same live prices — identical
+inputs, always 0%.
 
-**Fix:** Preserve the filing-period AM (computed from the original
-`adj_close`) before the live-price overwrite, so the chart can show
-the actual change from last filing to current market price.
+**Fix:** `runner.py` now copies `acquirers_multiple` to
+`filing_acquirers_multiple` before the live-price update. The AM
+chart reads `filing_acquirers_multiple` as the baseline for %
+change calculation.

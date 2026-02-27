@@ -139,6 +139,7 @@ def _make_companies() -> pd.DataFrame:
         "debt_cash_ratio": [0.25, 0.25],
         "fcf_per_share": [13.0, 11.5],
         "acquirers_multiple": [-0.131, -0.096],
+        "filing_acquirers_multiple": [-0.131, -0.096],
         "fcf_to_market_cap": [2.0, 1.21],
         "period_idx": [3, 3],
     }, index=pd.Index([1, 2], name="entity_id"))
@@ -406,6 +407,26 @@ class TestAcquirersMultipleAnalysis:
     ) -> None:
         fig = acquirers_multiple_analysis(results, ["AAA", "BBB"])
         assert isinstance(fig, Figure)
+
+    def test_pct_change_uses_filing_am(self) -> None:
+        """% change annotation uses filing-period AM, not live-updated AM."""
+        r = _make_results()
+        # Set filing AM different from live AM to verify non-zero % change.
+        # filing_acquirers_multiple = original from financial data
+        # acquirers_multiple = updated by live prices (different value)
+        r.companies["filing_acquirers_multiple"] = [-0.200, -0.150]
+        r.companies["acquirers_multiple"] = [-0.100, -0.075]
+
+        fig = acquirers_multiple_analysis(r, ["AAA", "BBB"])
+        assert isinstance(fig, Figure)
+        # Verify annotations exist with non-zero % changes.
+        ax = fig.axes[0]
+        pct_texts = [
+            child for child in ax.get_children()
+            if hasattr(child, "get_text") and "%" in child.get_text()
+            and child.get_text() != "+0%"
+        ]
+        assert len(pct_texts) > 0, "Expected non-zero % change annotations"
 
 
 class TestValuationUpsideComparison:

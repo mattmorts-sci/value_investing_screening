@@ -198,6 +198,9 @@ def run_analysis(config: AnalysisConfig) -> AnalysisResults:
         len(symbols),
     )
 
+    # Preserve filing-period AM before live-price overwrite (used by AM chart).
+    companies["filing_acquirers_multiple"] = companies["acquirers_multiple"]
+
     # Step 9: Update metrics with live prices.
     companies = _update_live_metrics(companies, live_prices)
 

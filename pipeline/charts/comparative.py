@@ -243,7 +243,7 @@ def acquirers_multiple_analysis(
         companies = companies.iloc[:20]
 
     syms = companies["symbol"].values
-    am_values = companies["acquirers_multiple"].astype(float).values
+    am_values = companies["filing_acquirers_multiple"].astype(float).values
     n = len(syms)
     ts = results.time_series
 
@@ -331,7 +331,8 @@ def acquirers_multiple_analysis(
                label="AM = 10 (threshold)")
 
     # Floor y-axis at -10
-    ax.set_ylim(bottom=am_floor)
+    am_ceiling = 250.0
+    ax.set_ylim(bottom=am_floor, top=am_ceiling)
 
     ax.set_xticks(range(n))
     ax.set_xticklabels(syms, rotation=45, ha="right", fontsize=8)

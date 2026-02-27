@@ -76,6 +76,7 @@ def _make_companies() -> pd.DataFrame:
         "debt_cash_ratio": [0.25, 0.25],
         "fcf_per_share": [12.0, 11.0],
         "acquirers_multiple": [-0.164, -0.109],
+        "filing_acquirers_multiple": [-0.164, -0.109],
         "fcf_to_market_cap": [2.0, 1.222],
         "period_idx": [1, 1],
     }, index=pd.Index([1, 2], name="entity_id"))
@@ -238,6 +239,20 @@ class TestUpdateLiveMetrics:
         _update_live_metrics(companies, live_prices)
 
         assert companies.at[1, "adj_close"] == original_price
+
+    def test_filing_am_preserved_after_live_update(self) -> None:
+        """filing_acquirers_multiple retains original value after live overwrite."""
+        companies = _make_companies()
+        original_am = companies["acquirers_multiple"].copy()
+
+        # Simulate what runner.py does: copy before live update.
+        companies["filing_acquirers_multiple"] = companies["acquirers_multiple"]
+        result = _update_live_metrics(companies, {"AAA": 10.0})
+
+        # Live AM should differ (price changed).
+        assert result.at[1, "acquirers_multiple"] != original_am[1]
+        # Filing AM should be unchanged.
+        assert result.at[1, "filing_acquirers_multiple"] == original_am[1]
 
     def test_empty_live_prices(self) -> None:
         companies = _make_companies()

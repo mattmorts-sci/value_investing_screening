@@ -110,6 +110,7 @@ def _make_companies() -> pd.DataFrame:
         "debt_cash_ratio": [0.25, 0.25],
         "fcf_per_share": [13.0, 11.5],
         "acquirers_multiple": [-0.131, -0.096],
+        "filing_acquirers_multiple": [-0.131, -0.096],
         "fcf_to_market_cap": [2.0, 1.21],
         "period_idx": [3, 3],
     }, index=pd.Index([1, 2], name="entity_id"))
