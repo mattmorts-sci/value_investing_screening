@@ -7,7 +7,6 @@ __pycache__/
 # Dir
 cache/
 output/
-LEGACY/
 
 # Notebooks
 *.ipynb

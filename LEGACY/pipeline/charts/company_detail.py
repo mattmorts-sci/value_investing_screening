@@ -77,7 +77,7 @@ def historical_growth(results: AnalysisResults, entity_id: int) -> Figure:
 
     Quarterly growth rates from time_series, displayed as percentages.
     Includes an annotation box with annualised volatility.
-    Values capped at +/-100% for display clarity.
+    Raw values plotted without capping.
 
     Args:
         results: Complete pipeline output.
@@ -94,16 +94,12 @@ def historical_growth(results: AnalysisResults, entity_id: int) -> Figure:
     fcf_growth = np.asarray(df["fcf_growth"], dtype=float) * 100
     rev_growth = np.asarray(df["revenue_growth"], dtype=float) * 100
 
-    # Cap display at +/-100%
-    fcf_display = np.clip(fcf_growth, -100, 100)
-    rev_display = np.clip(rev_growth, -100, 100)
-
     fig, ax = plt.subplots(figsize=(10, 6))
     width = 0.35
     x = np.arange(len(periods))
 
-    ax.bar(x - width / 2, fcf_display, width, label="FCF Growth", color=_C0)
-    ax.bar(x + width / 2, rev_display, width, label="Revenue Growth", color=_C1)
+    ax.bar(x - width / 2, fcf_growth, width, label="FCF Growth", color=_C0)
+    ax.bar(x + width / 2, rev_growth, width, label="Revenue Growth", color=_C1)
 
     ax.set_xlabel("Year")
     ax.set_ylabel("Growth Rate (%)")
