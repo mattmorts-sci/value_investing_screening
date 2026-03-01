@@ -6,6 +6,10 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 
+# Prices below this floor are treated as corrupted or meaningless.
+# Prevents sub-penny prices from producing extreme returns.
+MIN_PRICE_FLOOR: float = 0.01
+
 
 class SortOption(Enum):
     """Screening sort options."""

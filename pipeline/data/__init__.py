@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import logging
+import math
 
-from pipeline.config import PipelineConfig
+from pipeline.config import MIN_PRICE_FLOOR, PipelineConfig
 from pipeline.data.fmp import load_company as _load_from_fmp
 from pipeline.data.fmp import load_universe
 from pipeline.data.fmp import lookup_entity_ids
@@ -48,10 +49,10 @@ def load_company(entity_id: int, config: PipelineConfig) -> CompanyData | None:
             "%s: using database price $%.2f", company.symbol, company.latest_price
         )
 
-    if company.latest_price <= 0:
+    if not math.isfinite(company.latest_price) or company.latest_price < MIN_PRICE_FLOOR:
         logger.warning(
-            "%s: no valid price (%.2f), skipping",
-            company.symbol, company.latest_price,
+            "%s: price below floor (%.4f < %.2f), skipping",
+            company.symbol, company.latest_price, MIN_PRICE_FLOOR,
         )
         return None
 

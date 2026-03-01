@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import datetime
+import math
 import logging
 from dataclasses import dataclass
 
 import pandas as pd
 
+from pipeline.config import MIN_PRICE_FLOOR
 from pipeline.data.models import CompanyData
 
 logger = logging.getLogger(__name__)
@@ -23,9 +25,9 @@ class SentimentMetrics:
 
     Attributes:
         return_6m: 6-month simple price return. None if insufficient data
-            or zero reference price.
+            or sub-penny reference price.
         return_12m: 12-month simple price return. None if insufficient data
-            or zero reference price.
+            or sub-penny reference price.
     """
 
     return_6m: float | None
@@ -45,14 +47,17 @@ def _find_closest_close(
 
     Returns:
         The close price on the nearest available date, or None if the
-        DataFrame is empty.
+        DataFrame is empty or the value is not finite.
     """
     if price_history.empty:
         return None
 
     deltas = (price_history["date"] - pd.Timestamp(target_date)).abs()
     idx = deltas.idxmin()
-    return float(price_history.loc[idx, "close"])  # type: ignore[arg-type]
+    value = float(price_history.loc[idx, "close"])  # type: ignore[arg-type]
+    if not math.isfinite(value):
+        return None
+    return value
 
 
 def _compute_return(
@@ -64,7 +69,7 @@ def _compute_return(
     """Compute simple return over a lookback period.
 
     Returns None if the price history does not span the required period
-    or the reference close is zero.
+    or the reference close is below the price floor.
 
     Args:
         price_history: DataFrame with 'date' (datetime64) and 'close' columns.
@@ -83,7 +88,7 @@ def _compute_return(
         return None
 
     ref_close = _find_closest_close(price_history, target_date)
-    if ref_close is None or ref_close == 0.0:
+    if ref_close is None or ref_close < MIN_PRICE_FLOOR:
         return None
 
     return (latest_close - ref_close) / ref_close
@@ -116,8 +121,8 @@ def compute_sentiment(company: CompanyData) -> SentimentMetrics:
     latest_date = ph["date"].max().date()
     latest_close = float(ph.loc[ph["date"].idxmax(), "close"])  # type: ignore[arg-type]
 
-    if latest_close == 0.0:
-        logger.debug("%s: latest close is zero", company.symbol)
+    if not math.isfinite(latest_close) or latest_close < MIN_PRICE_FLOOR:
+        logger.debug("%s: latest close below price floor", company.symbol)
         return SentimentMetrics(return_6m=None, return_12m=None)
 
     return_6m = _compute_return(ph, latest_date, latest_close, _DAYS_6M)

@@ -16,6 +16,8 @@ The pipeline reads quarterly financial data from a local FMP (Financial Modeling
 - **FMP database** — a local SQLite database populated by the FMP data collector (default path: `~/projects/Pers/financial_db/data/fmp.db`)
 - Price history in the database (used for sentiment metrics)
 
+**Price floor:** Prices below $0.01 are treated as corrupted data and discarded. Companies with a latest price below this floor are excluded from processing. Sentiment return calculations also skip sub-penny reference prices.
+
 
 ## Installation
 
@@ -240,7 +242,7 @@ Return on invested capital, where NOPAT = EBIT x (1 - effective tax rate) and in
 
 | Column | Description |
 |---|---|
-| `interest_coverage` | TTM EBIT divided by TTM interest expense. Measures ability to service debt from operating earnings. Higher is safer. Empty if the company has no interest expense. |
+| `interest_coverage` | TTM EBIT divided by TTM interest expense. Measures ability to service debt from operating earnings. Higher is safer. Empty if the company has no interest expense or has net interest income. |
 | `ocf_to_debt` | TTM operating cash flow divided by latest total debt. Measures ability to retire debt from cash flow. Higher is safer. Empty if the company has no debt. |
 
 ### Sentiment

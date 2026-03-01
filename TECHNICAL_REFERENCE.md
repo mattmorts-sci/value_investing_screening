@@ -31,7 +31,7 @@ CLI (pipeline/__main__.py, pipeline/main.py)
 
 **Data flow:** FMP database + live price → `CompanyData` → five metric modules (independent, no cross-dependencies) → simulation (depends on trends) → screening (consumes all metrics + simulation) → CSV export or HTML detail report.
 
-**Module file:** `pipeline/config.py` — all configuration dataclasses.
+**Module file:** `pipeline/config.py` — all configuration dataclasses and the `MIN_PRICE_FLOOR` constant.
 
 ---
 
@@ -70,7 +70,7 @@ Defined in `pipeline/data/models.py`. Central data contract consumed by all metr
 
 Column names are mapped from FMP camelCase to pipeline snake_case at load time.
 
-**Live price** (`pipeline/data/live_price.py`): FMP batch-quote API (requires `FMP_API_KEY` environment variable), with yfinance fallback. Returns a single current price per symbol.
+**Live price** (`pipeline/data/live_price.py`): FMP batch-quote API (requires `FMP_API_KEY` environment variable), with yfinance fallback. Returns a single current price per symbol. Prices below `MIN_PRICE_FLOOR` are discarded (returns `None`).
 
 ### Loading Sequence
 
@@ -82,7 +82,7 @@ Column names are mapped from FMP camelCase to pipeline snake_case at load time.
    1. Load entity metadata, quarterly financials (income + balance + cash flow joined), price history, and company profile from the FMP database.
    2. Fetch current price via `fetch_current_price` (FMP API, then yfinance fallback).
    3. If a live price is available, overwrite `latest_price` and recalculate `market_cap` as `live_price * shares_outstanding`.
-   4. Returns `CompanyData`, or `None` if critical data is missing (no entity row, no financials, no company profile).
+   4. Returns `CompanyData`, or `None` if critical data is missing (no entity row, no financials, no company profile, or `latest_price < MIN_PRICE_FLOOR`).
 
 ---
 
@@ -161,7 +161,7 @@ Returns `None` if any sub-computation lacks sufficient data.
 
 | Field | Type | Description |
 |---|---|---|
-| `interest_coverage` | `float \| None` | TTM EBIT / TTM interest expense. `None` if interest expense is zero or missing |
+| `interest_coverage` | `float \| None` | TTM EBIT / TTM interest expense. `None` if interest expense is zero, negative (net interest income), or missing |
 | `ocf_to_debt` | `float \| None` | TTM OCF / latest total debt. `None` if total debt is zero or missing |
 
 TTM values sum the last 4 quarters (or fewer if unavailable). Balance sheet values from the latest quarter.
@@ -204,7 +204,7 @@ TTM values sum the last 4 quarters (or fewer if unavailable). Balance sheet valu
 | `return_6m` | `float \| None` | 6-month simple price return (182 calendar days) |
 | `return_12m` | `float \| None` | 12-month simple price return (365 calendar days) |
 
-Looks up the close price on the nearest available trading date to the target date. Returns `None` if price history does not span the lookback period or the reference close is zero.
+Looks up the close price on the nearest available trading date to the target date. Both returns are `None` if the latest close is below `MIN_PRICE_FLOOR`. Individual returns are `None` if price history does not span the lookback period or the reference close is below `MIN_PRICE_FLOOR`.
 
 ---
 
@@ -228,6 +228,7 @@ Constructed in `pipeline/main.py._build_simulation_input` from `TrendMetrics` an
 | `conversion_is_fallback` | `bool` | `TrendMetrics.conversion_is_fallback` |
 | `starting_revenue` | `float` | Latest quarterly revenue from `CompanyData.financials` |
 | `shares_outstanding` | `float` | `CompanyData.shares_outstanding` |
+| `num_historical_quarters` | `int` | Length of `CompanyData.financials`. Offsets margin and conversion regression indices so projections continue from the historical endpoint |
 
 ### PercentileBands
 
@@ -267,14 +268,14 @@ Each of the `num_replicates` paths runs `projection_years * 4` quarters:
 1. **Sample growth** -- draw from log-normal distribution. Growth rates are modelled as `(1 + g) ~ LogNormal(mu, sigma)` so revenue cannot go negative. If CV of the growth distribution exceeds `cv_cap`, variance is clamped.
 2. **Apply constraints** -- see constraint list below.
 3. **Project revenue** -- `revenue = revenue * (1 + constrained_growth)`.
-4. **Compute margin** -- `margin = margin_intercept + margin_slope * quarter_offset`.
+4. **Compute margin** -- `margin = margin_intercept + margin_slope * regression_idx`, where `regression_idx = num_historical_quarters + quarter_index`. This continues the regression from the last historical data point rather than resetting to the intercept.
 5. **Operating income** -- `revenue * margin`.
-6. **FCF conversion** -- if fallback: use `conversion_median`. Otherwise: `conversion_intercept + conversion_slope * quarter_offset`.
+6. **FCF conversion** -- if fallback: use `conversion_median`. Otherwise: `conversion_intercept + conversion_slope * regression_idx` (same offset as margin).
 7. **FCF and discount** -- `FCF = operating_income * conversion`. Discount each quarter's FCF to present value using `quarterly_discount = (1 + discount_rate)^0.25`.
 
-**Terminal value:** After the last projected quarter, a perpetuity growth model is applied: `TV = annual_FCF * (1 + terminal_growth_rate) / (discount_rate - terminal_growth_rate)`, discounted back to present. `annual_FCF = last_quarterly_FCF * 4`. Skipped if `discount_rate <= terminal_growth_rate`.
+**Terminal value:** After the last projected quarter, a perpetuity growth model is applied: `TV = annual_FCF * (1 + terminal_growth_rate) / (discount_rate - terminal_growth_rate)`, discounted back to present. `annual_FCF = last_quarterly_FCF * 4`. Only applied when the last projected quarter's FCF is positive. Skipped if `discount_rate <= terminal_growth_rate`.
 
-**IV per share:** `total_PV / shares_outstanding`. Percentiles computed across all replicates.
+**IV per share:** `total_PV / shares_outstanding`. Raises `ValueError` if `shares_outstanding <= 0` or `starting_revenue <= 0`. Percentiles computed across all replicates.
 
 ### Growth Constraints (7)
 
@@ -286,7 +287,7 @@ Applied in order to each sampled growth rate:
 | 2 | **Per-quarter growth caps** | Two tiers based on `revenue_ratio = current_revenue / starting_revenue`. **Early** (ratio <= `size_tier_threshold`): clamped to `[early_negative_cap, early_positive_cap]`. **Late** (ratio > threshold): `[late_negative_cap, late_positive_cap]`. |
 | 3 | **Cumulative cap** | Revenue cannot exceed `cumulative_cap * starting_revenue`. Growth reduced to enforce. |
 | 4 | **CAGR backstop** | Annualised growth from start cannot exceed `cagr_backstop`. Uses `(1 + cagr_backstop)^years_elapsed` as maximum factor. |
-| 5 | **Momentum exhaustion** | Positive mean: growth capped at `momentum_upper * historical_mean`. Negative mean: growth floored at `momentum_upper * historical_mean`. Skipped for near-zero mean. |
+| 5 | **Momentum exhaustion** | Positive mean: growth capped at `momentum_upper * historical_mean`. Negative mean: growth floored at `momentum_lower * historical_mean`. Skipped for near-zero mean. |
 | 6 | **Time decay** | Growth above `time_decay_growth_threshold` decays by `time_decay_factor^quarter_idx`. Only the excess above the threshold decays. |
 | 7 | **Size penalty** | Positive growth scaled down as revenue grows. Linear interpolation from `size_penalty_max` (at ratio=1) to `size_penalty_min` (at ratio=`cumulative_cap`). |
 
@@ -493,6 +494,12 @@ Resolves tickers to entity IDs via `lookup_entity_ids`, loads each company, comp
 ## Configuration
 
 All configuration is Python dataclasses in `pipeline/config.py`.
+
+### Constants
+
+| Name | Value | Description |
+|---|---|---|
+| `MIN_PRICE_FLOOR` | `0.01` | Minimum valid price. Prices below this are treated as corrupted. Applied at live price fetch, company loading, and sentiment return computation. |
 
 ### PipelineConfig
 

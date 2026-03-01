@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 
 import requests
+
+from pipeline.config import MIN_PRICE_FLOOR
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +49,13 @@ def _fetch_fmp_price(symbol: str, api_key: str) -> float | None:
         if data and isinstance(data, list) and len(data) > 0:
             price = data[0].get("price")
             if price is not None:
-                return float(price)
+                price = float(price)
+                if not math.isfinite(price) or price < MIN_PRICE_FLOOR:
+                    logger.warning(
+                        "%s: FMP price below floor (%.4f)", symbol, price
+                    )
+                    return None
+                return price
     except (requests.RequestException, ValueError, KeyError) as e:
         logger.warning("%s: FMP API error: %s", symbol, e)
 
@@ -61,7 +70,13 @@ def _fetch_yfinance_price(symbol: str) -> float | None:
         ticker = yf.Ticker(symbol)
         hist = ticker.history(period="5d")
         if not hist.empty:
-            return float(hist["Close"].iloc[-1])
+            price = float(hist["Close"].iloc[-1])
+            if not math.isfinite(price) or price < MIN_PRICE_FLOOR:
+                logger.warning(
+                    "%s: yfinance price below floor (%.4f)", symbol, price
+                )
+                return None
+            return price
     except Exception as e:
         logger.warning("%s: yfinance error: %s", symbol, e)
 
